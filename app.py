@@ -241,7 +241,7 @@ if search_button:
     except Exception as e:
         st.error(f"Search/extraction failed: {e}")
         st.info(
-            "If your Gemini account does not expose Gemini 3.7 Flash, change the "
+            "If your Gemini account does not expose Gemini 3.5 Flash, change the "
             "model name in app.py to another model that supports Google Search grounding."
         )
 
