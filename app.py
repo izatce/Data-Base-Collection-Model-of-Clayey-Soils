@@ -222,7 +222,7 @@ if search_button:
             "Searching multiple web sources and extracting only reported laboratory values..."
         ):
             response = client.models.generate_content(
-                model="gemini-3.7-flash",
+                model="gemini-2.5-flash-lite",
                 contents=build_prompt(),
                 config=config
             )
@@ -241,7 +241,7 @@ if search_button:
     except Exception as e:
         st.error(f"Search/extraction failed: {e}")
         st.info(
-            "If your Gemini account does not expose Gemini 3.5 Flash, change the "
+            "If your Gemini account does not expose Gemini 2.5 Flash-Lite, change the "
             "model name in app.py to another model that supports Google Search grounding."
         )
 
