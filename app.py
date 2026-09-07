@@ -1,10 +1,16 @@
-
-import os, json, re
+import os
+import json
+import time
 from pathlib import Path
+
 import pandas as pd
 import streamlit as st
-from google import genai
-from google.genai import types
+from groq import Groq
+
+
+# ============================================================
+# PAGE CONFIGURATION
+# ============================================================
 
 st.set_page_config(
     page_title="Real Clayey Soil Literature Search",
@@ -12,332 +18,745 @@ st.set_page_config(
     layout="wide"
 )
 
-DATA_FILE = Path(__file__).parent / "real_clayey_soil_literature_database.xlsx"
 
-# -----------------------------
-# Existing local database
-# -----------------------------
-@st.cache_data
-def load_local_data():
-    if DATA_FILE.exists():
-        return pd.read_excel(DATA_FILE, sheet_name="MASTER_DATA")
-    return pd.DataFrame()
+# ============================================================
+# GROQ API KEY
+# ============================================================
 
-@st.cache_data
-def load_references():
-    if DATA_FILE.exists():
-        return pd.read_excel(DATA_FILE, sheet_name="REFERENCES")
-    return pd.DataFrame()
+GROQ_API_KEY = st.secrets.get(
+    "GROQ_API_KEY",
+    os.getenv("GROQ_API_KEY", "")
+)
 
-local_df = load_local_data()
-local_refs = load_references()
 
-# -----------------------------
-# Gemini client
-# -----------------------------
-API_KEY = st.secrets.get("GEMINI_API_KEY", os.getenv("GEMINI_API_KEY", ""))
+# ============================================================
+# PAGE HEADER
+# ============================================================
 
 st.title("🔎 Real Clayey Soil Literature Search")
+
 st.caption(
-    "Automatically searches the public web for published laboratory data "
-    "for A-6, A-7-5 and A-7-6 soils. No ANN prediction is used."
+    "Automatically searches different researchers and public sources "
+    "for REAL reported laboratory data. No ANN prediction is used."
 )
 
-st.warning(
-    "Important: the search assistant is instructed to extract only values that "
-    "are explicitly reported in the source. If a property cannot be verified, "
-    "it must be returned as NR (Not Reported)."
+st.info(
+    """
+    **Research rule:** Only values explicitly reported in the original
+    publication/report are accepted. Missing properties are recorded as
+    **NR (Not Reported)**. The system must not estimate or fabricate
+    laboratory results.
+    """
 )
 
-# -----------------------------
-# Search controls
-# -----------------------------
+
+# ============================================================
+# SIDEBAR
+# ============================================================
+
 with st.sidebar:
-    st.header("Search criteria")
+
+    st.header("🔬 Literature Search Settings")
 
     aashto_classes = st.multiselect(
-        "AASHTO classes",
-        ["A-6", "A-7-5", "A-7-6"],
-        default=["A-6", "A-7-5", "A-7-6"]
-    )
-
-    properties = st.multiselect(
-        "Required / desired properties",
+        "AASHTO Soil Classes",
         [
-            "LL", "PL", "PI", "Clay %", "Silt %", "Sand %",
-            "Gravel %", "Passing No.200", "Gs",
-            "Natural Water Content", "OMC", "MDD",
-            "CBR soaked", "CBR unsoaked", "UCS",
-            "Cohesion", "Phi"
+            "A-6",
+            "A-7-5",
+            "A-7-6"
         ],
         default=[
-            "LL", "PL", "PI", "Clay %",
-            "Gs", "Natural Water Content",
-            "OMC", "MDD", "CBR soaked",
-            "CBR unsoaked", "UCS", "Cohesion", "Phi"
+            "A-6",
+            "A-7-5",
+            "A-7-6"
         ]
     )
 
-    max_sources = st.slider(
-        "Maximum source records to request",
-        min_value=5, max_value=50, value=20
+    st.subheader("Properties to collect")
+
+    properties = st.multiselect(
+        "Select properties",
+        [
+            "Liquid Limit (LL)",
+            "Plastic Limit (PL)",
+            "Plasticity Index (PI)",
+            "Clay %",
+            "Silt %",
+            "Sand %",
+            "Gravel %",
+            "Passing No. 200 %",
+            "Specific Gravity (Gs)",
+            "Natural Water Content",
+            "OMC",
+            "MDD",
+            "Soaked CBR",
+            "Unsoaked CBR",
+            "UCS",
+            "Cohesion",
+            "Friction Angle"
+        ],
+        default=[
+            "Liquid Limit (LL)",
+            "Plastic Limit (PL)",
+            "Plasticity Index (PI)",
+            "Clay %",
+            "Specific Gravity (Gs)",
+            "Natural Water Content",
+            "OMC",
+            "MDD",
+            "Soaked CBR",
+            "Unsoaked CBR",
+            "UCS",
+            "Cohesion",
+            "Friction Angle"
+        ]
     )
 
-    country_hint = st.text_input(
-        "Country/location filter (optional)",
+    country = st.text_input(
+        "Country / Region",
         placeholder="Pakistan, India, Nigeria, Ethiopia..."
     )
 
-    include_reports = st.checkbox(
-        "Include theses/reports/open datasets",
-        value=True
+    location = st.text_input(
+        "Specific location (optional)",
+        placeholder="Jamshoro, Sindh..."
+    )
+
+    max_records = st.slider(
+        "Maximum records per search",
+        min_value=5,
+        max_value=30,
+        value=10
+    )
+
+    st.subheader("Search type")
+
+    search_type = st.selectbox(
+        "Literature search",
+        [
+            "General geotechnical properties",
+            "CBR + Compaction",
+            "UCS",
+            "Direct Shear",
+            "Index Properties",
+            "All Properties"
+        ]
     )
 
     search_button = st.button(
-        "🔎 Search real literature data",
+        "🔎 SEARCH REAL DATA",
         type="primary",
         use_container_width=True
     )
 
-# -----------------------------
-# Search prompt
-# -----------------------------
-def build_prompt():
+
+# ============================================================
+# SEARCH PROMPT
+# ============================================================
+
+def build_search_prompt():
+
     class_text = ", ".join(aashto_classes)
-    prop_text = ", ".join(properties)
-    report_rule = (
-        "Include peer-reviewed papers, government reports, theses, and openly "
-        "available research datasets when they contain traceable laboratory observations."
-        if include_reports else
-        "Prefer peer-reviewed journal/conference papers and exclude theses/reports unless unavoidable."
+
+    property_text = ", ".join(properties)
+
+    country_text = (
+        country
+        if country
+        else "No country restriction"
+    )
+
+    location_text = (
+        location
+        if location
+        else "No specific location restriction"
     )
 
     return f"""
-You are a rigorous geotechnical literature-data extraction agent.
 
-TASK:
-Search the public web and identify REAL, traceable laboratory observations for
-clayey/fine-grained soils classified as:
+You are an expert geotechnical engineering literature-data
+collection agent.
+
+Your task is to SEARCH THE PUBLIC WEB and find REAL LABORATORY
+DATA reported by different researchers.
+
+TARGET AASHTO CLASSES:
+
 {class_text}
 
-The requested engineering/index properties are:
-{prop_text}
+TARGET PROPERTIES:
 
-{report_rule}
+{property_text}
 
-Country/location preference:
-{country_hint if country_hint else "No country restriction."}
+SEARCH TYPE:
 
-CRITICAL DATA RULES:
-1. Search multiple independent sources/researchers. Do not rely on one paper.
-2. Prefer the original paper/report/dataset over a secondary paper that merely
-   cites another study.
-3. Extract ONLY numerical values explicitly visible/reported by the source.
-4. NEVER estimate, interpolate, calculate, infer, or invent a missing value.
-5. If a requested property is not reported for a record, enter "NR".
-6. Preserve the source's original value and unit.
-7. Do not treat ANN/ML predictions as laboratory measurements.
-8. Separate natural/untreated soil from stabilized soil. If a paper reports
-   both, use the untreated/natural row when the objective is natural clayey soil.
-9. Preserve the published AASHTO class. Do not silently reclassify it.
-10. For every numerical record provide the exact source, DOI/URL if available,
-    and the table/figure/section/page where the value was found.
-11. Do not duplicate the same soil record merely because several papers cite it.
-12. If a source cannot be opened or the value cannot be verified, do not use
-    the value.
+{search_type}
 
-OUTPUT:
-Return JSON only, with this structure:
+COUNTRY:
+
+{country_text}
+
+LOCATION:
+
+{location_text}
+
+
+============================================================
+IMPORTANT RESEARCH RULES
+============================================================
+
+1. Search MULTIPLE independent researchers.
+
+2. Search original scientific papers, conference papers,
+   theses, government reports, research reports and publicly
+   available datasets.
+
+3. Prefer the ORIGINAL SOURCE where the laboratory data were
+   actually measured.
+
+4. Do NOT rely only on review papers.
+
+5. Do NOT use ANN, Random Forest, SVM, regression or other
+   machine-learning predictions as laboratory measurements.
+
+6. Do NOT estimate missing values.
+
+7. Do NOT interpolate missing values.
+
+8. Do NOT calculate an engineering property from another
+   property unless the source itself explicitly reports that
+   calculated value.
+
+9. If a property is not reported, write:
+
+   NR
+
+10. Preserve the ORIGINAL reported value and UNIT.
+
+11. Clearly distinguish:
+    - Natural soil
+    - Remoulded soil
+    - Stabilized soil
+    - Treated soil
+    - Soaked CBR
+    - Unsoaked CBR
+
+12. For this database, natural/untreated soil should be
+    preferred.
+
+13. Preserve the published AASHTO classification.
+
+14. Do NOT silently reclassify a soil.
+
+15. Every record must have:
+
+    Author
+    Year
+    Paper title
+    Journal/report
+    Country
+    Location
+    AASHTO classification
+    USCS classification if available
+    Source URL
+    DOI if available
+    Table/Figure/Section/Page provenance
+
+16. If the numerical value cannot be verified from the
+    source, return NR.
+
+17. Avoid duplicate soil specimens.
+
+18. One paper may contain multiple soil samples.
+    Each actual sample should be a separate record.
+
+19. The final database must contain REAL observations,
+    NOT AI-generated data.
+
+20. Search at least several different researchers before
+    finishing the search.
+
+21. For important values, prefer visiting the original
+    source webpage/PDF when possible.
+
+22. Maximum records:
+
+{max_records}
+
+
+============================================================
+OUTPUT FORMAT
+============================================================
+
+Return VALID JSON only.
+
+Use this structure:
 
 {{
-  "records": [
-    {{
-      "Record_ID": "...",
-      "Source_ID": "...",
-      "Authors": "...",
-      "Year": 2020,
-      "Paper_Title": "...",
-      "Journal_or_Report": "...",
-      "Country": "...",
-      "Location": "...",
-      "Soil_Description": "...",
-      "AASHTO_Class": "...",
-      "USCS_Class": "...",
-      "Gravel_pct": "...",
-      "Sand_pct": "...",
-      "Silt_pct": "...",
-      "Clay_pct": "...",
-      "Passing_No200_pct": "...",
-      "LL_pct": "...",
-      "PL_pct": "...",
-      "PI_pct": "...",
-      "Gs": "...",
-      "Natural_Water_pct": "...",
-      "OMC_pct": "...",
-      "MDD": "...",
-      "CBR_Unsoaked_pct": "...",
-      "CBR_Soaked_pct": "...",
-      "UCS_kPa": "...",
-      "Cohesion_kPa": "...",
-      "Phi_deg": "...",
-      "Test_Condition": "...",
-      "Compaction_Standard": "...",
-      "CBR_Standard": "...",
-      "Data_Status": "Measured",
-      "Source_URL": "...",
-      "DOI": "...",
-      "Provenance": "Table/Figure/Section/Page"
-    }}
-  ]
+    "records": [
+
+        {{
+            "Record_ID": "",
+            "Source_ID": "",
+
+            "Authors": "",
+            "Year": "",
+
+            "Paper_Title": "",
+            "Journal_or_Report": "",
+
+            "Country": "",
+            "Location": "",
+
+            "Soil_Description": "",
+
+            "AASHTO_Class": "",
+            "USCS_Class": "",
+
+            "Gravel_pct": "",
+            "Sand_pct": "",
+            "Silt_pct": "",
+            "Clay_pct": "",
+
+            "Passing_No200_pct": "",
+
+            "LL_pct": "",
+            "PL_pct": "",
+            "PI_pct": "",
+
+            "Gs": "",
+
+            "Natural_Water_pct": "",
+
+            "OMC_pct": "",
+            "MDD": "",
+
+            "CBR_Unsoaked_pct": "",
+            "CBR_Soaked_pct": "",
+
+            "UCS_kPa": "",
+
+            "Cohesion_kPa": "",
+            "Phi_deg": "",
+
+            "Test_Condition": "",
+
+            "Compaction_Standard": "",
+            "CBR_Standard": "",
+
+            "Data_Status": "Measured",
+
+            "Source_URL": "",
+            "DOI": "",
+
+            "Provenance": ""
+        }}
+
+    ]
 }}
 
-Return at most {max_sources} records.
+
+============================================================
+FINAL WARNING
+============================================================
+
+If the source does not explicitly report a value:
+
+RETURN:
+
+NR
+
+Never guess.
+Never fabricate.
+Never use an ML prediction as a measured laboratory result.
+
 """
 
-# -----------------------------
-# Execute grounded web search
-# -----------------------------
-if search_button:
-    if not API_KEY:
-        st.error(
-            "GEMINI_API_KEY is missing. Add it to Streamlit Secrets "
-            "or the environment."
-        )
-        st.stop()
+
+# ============================================================
+# GROQ SEARCH FUNCTION
+# ============================================================
+
+def search_literature(prompt):
+
+    client = Groq(
+        api_key=GROQ_API_KEY,
+        default_headers={
+            "Groq-Model-Version": "latest"
+        }
+    )
+
+    response = client.chat.completions.create(
+
+        model="groq/compound",
+
+        messages=[
+
+            {
+                "role": "system",
+                "content": """
+You are a strict scientific literature-data extraction
+assistant specializing in geotechnical engineering.
+
+Accuracy and source traceability are more important than
+completeness.
+
+Never invent laboratory measurements.
+"""
+            },
+
+            {
+                "role": "user",
+                "content": prompt
+            }
+
+        ],
+
+        temperature=0,
+
+        response_format={
+            "type": "json_object"
+        },
+
+        compound_custom={
+            "tools": {
+                "enabled_tools": [
+                    "web_search",
+                    "visit_website"
+                ]
+            }
+        }
+    )
+
+    return response
+
+
+# ============================================================
+# EXTRACT SEARCH SOURCES
+# ============================================================
+
+def extract_sources(response):
+
+    sources = []
 
     try:
-        client = genai.Client(api_key=API_KEY)
 
-        config = types.GenerateContentConfig(
-            temperature=0,
-            response_mime_type="application/json",
-            tools=[
-                types.Tool(
-                    google_search=types.GoogleSearch()
-                )
-            ]
+        message = response.choices[0].message
+
+        executed_tools = getattr(
+            message,
+            "executed_tools",
+            None
         )
+
+        if executed_tools:
+
+            for tool in executed_tools:
+
+                if hasattr(tool, "search_results"):
+
+                    results = tool.search_results
+
+                    if results:
+
+                        sources.append(
+                            str(results)
+                        )
+
+    except Exception:
+        pass
+
+    return sources
+
+
+# ============================================================
+# SEARCH BUTTON
+# ============================================================
+
+if search_button:
+
+    if not GROQ_API_KEY:
+
+        st.error(
+            "GROQ_API_KEY was not found."
+        )
+
+        st.stop()
+
+
+    if not aashto_classes:
+
+        st.warning(
+            "Please select at least one AASHTO class."
+        )
+
+        st.stop()
+
+
+    try:
 
         with st.spinner(
-            "Searching multiple web sources and extracting only reported laboratory values..."
+            "🔎 Searching researchers, papers and laboratory datasets..."
         ):
-            response = client.models.generate_content(
-                model="gemini-3.5-flash-lite",
-                contents=build_prompt(),
-                config=config
+
+            prompt = build_search_prompt()
+
+            response = search_literature(
+                prompt
             )
 
-        raw = response.text
-        result = json.loads(raw)
-        records = result.get("records", [])
+            raw_response = (
+                response
+                .choices[0]
+                .message
+                .content
+            )
 
-        st.session_state["search_records"] = records
-        st.session_state["search_raw"] = raw
+            result = json.loads(
+                raw_response
+            )
+
+            records = result.get(
+                "records",
+                []
+            )
+
+            result_df = pd.DataFrame(
+                records
+            )
+
+
+            # Store results
+            st.session_state[
+                "literature_records"
+            ] = result_df
+
+
+            # Store sources
+            st.session_state[
+                "literature_sources"
+            ] = extract_sources(
+                response
+            )
+
 
         st.success(
-            f"Search completed. {len(records)} literature records were returned."
+            f"Search completed. "
+            f"{len(result_df)} real literature records found."
         )
+
 
     except Exception as e:
-        st.error(f"Search/extraction failed: {e}")
+
+        error_text = str(e)
+
+        if (
+            "429" in error_text
+            or "rate" in error_text.lower()
+            or "quota" in error_text.lower()
+        ):
+
+            st.error(
+                """
+                Groq API rate limit or quota was reached.
+
+                Please wait and try again with fewer records.
+                """
+            )
+
+        else:
+
+            st.error(
+                f"Search failed:\n\n{error_text}"
+            )
+
+
+# ============================================================
+# DISPLAY RESULTS
+# ============================================================
+
+result_df = st.session_state.get(
+    "literature_records"
+)
+
+
+if (
+    result_df is not None
+    and not result_df.empty
+):
+
+    st.subheader(
+        "📚 Real Literature Records Found"
+    )
+
+    st.dataframe(
+        result_df,
+        use_container_width=True,
+        height=600
+    )
+
+
+    # --------------------------------------------------------
+    # DOWNLOAD CSV
+    # --------------------------------------------------------
+
+    csv_data = result_df.to_csv(
+        index=False
+    ).encode("utf-8")
+
+    st.download_button(
+
+        "⬇️ Download Search Results CSV",
+
+        csv_data,
+
+        "real_clayey_soil_literature.csv",
+
+        "text/csv",
+
+        use_container_width=True
+    )
+
+
+    # --------------------------------------------------------
+    # SOURCE INFORMATION
+    # --------------------------------------------------------
+
+    st.subheader(
+        "🔗 Search Sources"
+    )
+
+    sources = st.session_state.get(
+        "literature_sources",
+        []
+    )
+
+    if sources:
+
+        for i, source in enumerate(
+            sources,
+            start=1
+        ):
+
+            with st.expander(
+                f"Source search result {i}"
+            ):
+
+                st.text(
+                    source
+                )
+
+    else:
+
         st.info(
-            "If your Gemini account does not expose Gemini 3.5 Flash-Lite, change the "
-            "model name in app.py to another model that supports Google Search grounding."
+            "Source details are retained in the Source_URL, DOI "
+            "and Provenance columns."
         )
 
-# -----------------------------
-# Display results
-# -----------------------------
-records = st.session_state.get("search_records", [])
 
-if records:
-    search_df = pd.DataFrame(records)
+    # --------------------------------------------------------
+    # DATA QUALITY CHECK
+    # --------------------------------------------------------
 
-    st.subheader("🔬 Newly searched literature records")
-    st.dataframe(search_df, use_container_width=True, height=550)
-
-    st.download_button(
-        "⬇️ Download searched records as CSV",
-        search_df.to_csv(index=False).encode("utf-8"),
-        "new_real_clayey_soil_literature_records.csv",
-        "text/csv"
+    st.subheader(
+        "✅ Data Quality Check"
     )
 
-    # Save a combined research database
-    if st.button("➕ Add verified search records to database"):
-        try:
-            existing = local_df.copy()
+    col1, col2, col3, col4 = st.columns(4)
 
-            # Keep only matching master columns where possible.
-            master_cols = [
-                "Record_ID", "Source_ID", "Author_or_Organization", "Year",
-                "Country", "Location", "AASHTO_Class", "USCS_Class",
-                "Gravel_pct", "Sand_pct", "Silt_pct", "Clay_pct",
-                "Passing_No200_pct", "LL_pct", "PL_pct", "PI_pct", "Gs",
-                "Natural_Water_pct", "OMC_pct", "MDD",
-                "CBR_Unsoaked_pct", "CBR_Soaked_pct", "UCS_kPa",
-                "Cohesion_kPa", "Phi_deg", "Provenance"
-            ]
-
-            add = pd.DataFrame()
-            for col in master_cols:
-                source_col = col
-                if col == "Author_or_Organization":
-                    source_col = "Authors"
-                if source_col in search_df:
-                    add[col] = search_df[source_col]
-                else:
-                    add[col] = "NR"
-
-            combined = pd.concat([existing, add], ignore_index=True)
-            combined = combined.drop_duplicates(
-                subset=["Record_ID", "Source_ID"],
-                keep="first"
-            )
-
-            st.session_state["combined_df"] = combined
-            st.success(
-                f"Combined database now contains {len(combined)} records. "
-                "Download it below and review source provenance before thesis use."
-            )
-        except Exception as e:
-            st.error(f"Could not combine records: {e}")
-
-combined_df = st.session_state.get("combined_df")
-
-if combined_df is not None:
-    st.subheader("📚 Combined literature database")
-    st.dataframe(combined_df, use_container_width=True, height=450)
-
-    st.download_button(
-        "⬇️ Download combined database",
-        combined_df.to_csv(index=False).encode("utf-8"),
-        "real_clayey_soil_combined_literature_database.csv",
-        "text/csv"
+    col1.metric(
+        "Records",
+        len(result_df)
     )
 
-# -----------------------------
-# Existing database
-# -----------------------------
-with st.expander("View current local database"):
-    if not local_df.empty:
-        st.dataframe(local_df, use_container_width=True, height=400)
-    else:
-        st.info("No local database found.")
+    if "Source_ID" in result_df.columns:
 
-st.subheader("⚠️ Research verification protocol")
-st.markdown("""
-**The app searches first, but the researcher must verify the extracted values.**
+        col2.metric(
+            "Sources",
+            result_df[
+                "Source_ID"
+            ].nunique()
+        )
 
-For a value to be accepted into the final PhD dataset:
+    if "AASHTO_Class" in result_df.columns:
+
+        col3.metric(
+            "AASHTO groups",
+            result_df[
+                "AASHTO_Class"
+            ].nunique()
+        )
+
+    if "Authors" in result_df.columns:
+
+        col4.metric(
+            "Researchers",
+            result_df[
+                "Authors"
+            ].nunique()
+        )
+
+
+# ============================================================
+# RESEARCH WORKFLOW
+# ============================================================
+
+st.subheader(
+    "📊 Recommended Literature Data Collection Workflow"
+)
+
+st.markdown(
+"""
+### Batch 1
+**A-6 soils**
+
+### Batch 2
+**A-7-5 soils**
+
+### Batch 3
+**A-7-6 soils**
+
+### Batch 4
+**CBR + OMC + MDD**
+
+### Batch 5
+**UCS**
+
+### Batch 6
+**Direct shear → cohesion + φ**
+
+### Batch 7
+**LL + PL + PI + gradation + Gs + natural water content**
+
+The downloaded files can then be combined into your master
+PhD literature database.
+"""
+)
+
+
+# ============================================================
+# IMPORTANT RESEARCH NOTE
+# ============================================================
+
+st.warning(
+"""
+### ⚠️ Important
+
+This application is a **literature-data collection assistant**.
+
+Before using a value in your PhD thesis/database:
 
 1. Open the original paper/report.
-2. Confirm the soil is A-6, A-7-5 or A-7-6.
-3. Confirm the numerical value in the cited table/figure/section.
-4. Confirm whether the specimen is natural, remoulded, soaked, unsoaked or stabilized.
-5. Confirm the test standard and compaction condition where available.
-6. Keep the Source_ID and Provenance with the observation.
-7. Use **NR** when the source does not report a property.
+2. Confirm the soil sample.
+3. Confirm AASHTO classification.
+4. Confirm the numerical value.
+5. Confirm units.
+6. Confirm test condition.
+7. Confirm table/figure/page.
+8. Keep the Source_ID.
 
-This prevents the AI from turning literature interpretation into fabricated laboratory data.
-""")
+**NR = Not Reported.**
+
+Do not replace NR with an estimated value.
+"""
+)
